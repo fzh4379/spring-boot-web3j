@@ -16,6 +16,8 @@ import org.web3j.tx.gas.ContractGasProvider;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -80,24 +82,54 @@ public class EscrowService {
      */
     public List<Map<String, String>> listOrders() throws Exception {
         requireContract();
-        BigInteger latest = web3j.ethBlockNumber().send().getBlockNumber();
+        if (deployBlock == null || deployBlock.signum() < 0) {
+            throw new IllegalStateException("A valid deployment block is required for event scanning");
+        }
+
+        String scannedContractAddress = contractAddress;
+        BigInteger scanStartBlock = deployBlock;
+
+        var latestResponse = web3j.ethBlockNumber().send();
+        requireSuccessfulRpc(latestResponse, "eth_blockNumber");
+        BigInteger latest = latestResponse.getBlockNumber();
         BigInteger step = BigInteger.TEN;
         List<Log> logs = new ArrayList<>();
 
-        for (BigInteger from = deployBlock;
+        for (BigInteger from = scanStartBlock;
              from.compareTo(latest) <= 0;
              from = from.add(step)) {
             BigInteger to = from.add(step).subtract(BigInteger.ONE).min(latest);
             EthFilter filter = new EthFilter(
                     DefaultBlockParameter.valueOf(from),
                     DefaultBlockParameter.valueOf(to),
-                    contractAddress);
+                    scannedContractAddress);
             filter.addSingleTopic(EventEncoder.encode(Escrow.ORDERCREATED_EVENT));
-            web3j.ethGetLogs(filter).send().getLogs()
-                    .forEach(r -> logs.add((Log) r.get()));
+
+            var logsResponse = web3j.ethGetLogs(filter).send();
+            requireSuccessfulRpc(logsResponse, "eth_getLogs");
+            for (var result : logsResponse.getLogs()) {
+                Object value = result.get();
+                if (value instanceof Log eventLog) {
+                    logs.add(eventLog);
+                } else {
+                    throw new IllegalStateException(
+                            "eth_getLogs returned an unsupported log result type");
+                }
+            }
         }
 
-        return logs.stream().map(l -> {
+        logs.sort(
+                Comparator.comparing(Log::getBlockNumber)
+                        .thenComparing(Log::getLogIndex)
+        );
+
+        Map<String, Log> uniqueLogs = new LinkedHashMap<>();
+        for (Log eventLog : logs) {
+            String key = eventLog.getTransactionHash() + ":" + eventLog.getLogIndex();
+            uniqueLogs.putIfAbsent(key, eventLog);
+        }
+
+        return uniqueLogs.values().stream().map(l -> {
             Escrow.OrderCreatedEventResponse e = Escrow.getOrderCreatedEventFromLog(l);
             return Map.of(
                     "id", e.id.toString(),
@@ -107,6 +139,18 @@ public class EscrowService {
                     "blockNumber", l.getBlockNumber().toString(),
                     "transactionHash", l.getTransactionHash());
         }).toList();
+    }
+
+    private void requireSuccessfulRpc(
+            org.web3j.protocol.core.Response<?> response,
+            String method
+    ) {
+        if (response.hasError()) {
+            String message = response.getError() == null
+                    ? "unknown RPC error"
+                    : response.getError().getMessage();
+            throw new IllegalStateException(method + " failed: " + message);
+        }
     }
 
     // TODO：resolve(BigInteger id, boolean sellerWins)，返回 CompletableFuture<TransactionReceipt>
